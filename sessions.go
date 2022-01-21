@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
+	"github.com/gorilla/securecookie"
 )
 
 type user struct {
@@ -24,15 +24,10 @@ type user struct {
 	Start     time.Time `json:"-"`
 }
 
-type sessionStorage struct {
-}
-
 type jsonRequest struct {
 	UserID string           `json:"user"`
 	Type   string           `json:"command"`
 	Text   string           `json:"text"`
-	From   time.Time        `json:"from"`
-	To     time.Time        `json:"to"`
 	Data   *json.RawMessage `json:"data"`
 }
 
@@ -47,12 +42,19 @@ type appContext struct {
 	Port     string
 	Path     string
 	Server   *http.Server
-	Sessions map[string]*user
 	Signals  chan os.Signal
+	Sessions map[string]*user
+	Secretly *securecookie.SecureCookie
 }
 
 func main() {
-	app := appContext{IP: "172.16.0.6", Port: "8080", Path: "."}
+	powerUser := user{ID: "alpha", Email: "alef@app.com", Password: "omega", FirstName: "Дорогой", LastName: "Пользователь"}
+	hashKey := securecookie.GenerateRandomKey(32)
+	blockKey := securecookie.GenerateRandomKey(32)
+
+	app := appContext{IP: "127.0.0.1", Port: "8080", Path: "."}
+	app.Sessions[powerUser.ID] = &powerUser
+	app.Secretly = securecookie.New(hashKey, blockKey)
 
 	// Routing
 	http.DefaultServeMux.HandleFunc("/static", app.serveRoot)
@@ -89,12 +91,34 @@ func main() {
 }
 
 func (app *appContext) serveRoot(res http.ResponseWriter, req *http.Request) {
-	fname := path.Base(req.URL.Path)
-	fmt.Printf("[%s] Serving %s for %s\n", time.Now().Truncate(time.Second), fname, req.Header.Get("X-Forwarded-For"))
+	fileName := path.Base(req.URL.Path)
+	fmt.Printf("[%s] Serving %s for %s\n", time.Now().Truncate(time.Second), fileName, req.Header.Get("X-Real-IP"))
 	res.Header().Set("Cache-Control", "max-age=31536000, immutable")
 	res.Header().Set("X-Content-Type-Options", "nosniff")
+	if fileName == "welcome.html" {
+		if _, ok := app.authenticate(req); ok {
+			http.ServeFile(res, req, filepath.Join(app.Path, "static/welcome.html"))
+		} else {
+			http.ServeFile(res, req, filepath.Join(app.Path, "static/404.html"))
+		}
+	}
 	http.ServeFile(res, req, filepath.Join(app.Path, req.URL.Path))
 }
+
+func (app *appContext) authenticate(request *http.Request) (string, bool) {
+	if cookie, err := request.Cookie("session"); err == nil {
+		cookieData := make(map[string]string)
+		if err = app.Secretly.Decode("session", cookie.Value, &cookieData); err == nil {
+			user, found := app.Sessions[cookieData["id"]]
+			if found && time.Now().Before(user.Start.Add(5*time.Minute)) {
+				return user.ID, true
+			}
+		}
+	}
+	return "none", false
+}
+
+// func (app *appContext) setCookie(userID string, response http.ResponseWriter) {}
 
 func (app *appContext) apiHandler(response http.ResponseWriter, request *http.Request) {
 	//Recover
@@ -109,12 +133,11 @@ func (app *appContext) apiHandler(response http.ResponseWriter, request *http.Re
 
 	var command jsonRequest
 	// var params map[string]interface{}
-	ctx := context.Background()
+	// ctx := context.Background()
 	reply := jsonReply{Status: "error", Data: "unimplemented"}
 
 	err := json.NewDecoder(request.Body).Decode(&command)
 	if err != nil {
-		fmt.Println(err)
 		reply.Data = fmt.Sprintf("XHR decoding failed: %v", err)
 		json.NewEncoder(response).Encode(reply)
 		return
@@ -123,19 +146,42 @@ func (app *appContext) apiHandler(response http.ResponseWriter, request *http.Re
 	fmt.Println("Got", command.Type, "command")
 	switch command.Type {
 	case "login":
-	case "logout":
-	case "continue":
-		if len(command.Text) > 1 {
-			result, err := app.slots.DeleteOne(ctx, bson.M{"_id": command.Text})
-			if err == nil {
+		user, found := app.Sessions[command.UserID]
+		if found {
+			if command.Text == user.Password {
+				cookieData := map[string]string{"id": user.ID}
+				if encrypted, err := app.Secretly.Encode("session", cookieData); err == nil {
+					cookie := &http.Cookie{
+						Path:     "/",
+						Name:     "session",
+						Value:    encrypted,
+						Expires:  time.Now().Add(5 * time.Minute),
+						Secure:   false,
+						HttpOnly: true,
+					}
+					http.SetCookie(response, cookie)
+				}
+				fmt.Println("User [", user.ID, "] logged in")
+				user.Start = time.Now()
 				reply.Status = "ok"
-				reply.Data = command.Text
-				fmt.Printf("removed %v document(s)\n", result.DeletedCount)
 			} else {
-				reply.Data = err.Error()
+				reply.Data = "Entered password doesn't match"
 			}
-
+		} else {
+			reply.Data = "Entered id doesn't exist"
 		}
+	case "logout":
+		cookie := http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1}
+		http.SetCookie(response, &cookie)
+		reply.Status = "ok"
+	case "continue":
+		if id, ok := app.authenticate(request); ok {
+			user := app.Sessions[id]
+			reply.Data = map[string]string{"firstName": user.FirstName, "lastName": user.LastName}
+		} else {
+			reply.Data = "denied"
+		}
+		reply.Status = "ok"
 	}
 	json.NewEncoder(response).Encode(reply)
 }
