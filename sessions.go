@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -53,6 +52,7 @@ func main() {
 	blockKey := securecookie.GenerateRandomKey(32)
 
 	app := appContext{IP: "127.0.0.1", Port: "8080", Path: "."}
+	app.Sessions = make(map[string]*user)
 	app.Sessions[powerUser.ID] = &powerUser
 	app.Secretly = securecookie.New(hashKey, blockKey)
 
@@ -91,16 +91,23 @@ func main() {
 }
 
 func (app *appContext) serveRoot(res http.ResponseWriter, req *http.Request) {
-	fileName := path.Base(req.URL.Path)
-	fmt.Printf("[%s] Serving %s for %s\n", time.Now().Truncate(time.Second), fileName, req.Header.Get("X-Real-IP"))
-	res.Header().Set("Cache-Control", "max-age=31536000, immutable")
+	fmt.Println(req.URL.Path)
+	// overkill
+	req.Header.Del("If-Modified-Since")
+	res.Header().Set("Cache-Control", "no-cache, private, max-age=0")
+	res.Header().Set("Expires", time.Unix(0, 0).Format(http.TimeFormat))
+	res.Header().Set("Pragma", "no-cache")
+	res.Header().Set("X-Accel-Expires", "0")
 	res.Header().Set("X-Content-Type-Options", "nosniff")
-	if fileName == "welcome.html" {
+	if req.URL.Path == "/welcome.html" {
 		if _, ok := app.authenticate(req); ok {
-			http.ServeFile(res, req, filepath.Join(app.Path, "static/welcome.html"))
+			http.ServeFile(res, req, filepath.Join(app.Path, "welcome.html"))
+			fmt.Println("Serving welcome")
 		} else {
-			http.ServeFile(res, req, filepath.Join(app.Path, "static/404.html"))
+			http.ServeFile(res, req, filepath.Join(app.Path, "error404.html"))
+			fmt.Println("Serving 404")
 		}
+		return
 	}
 	http.ServeFile(res, req, filepath.Join(app.Path, req.URL.Path))
 }
@@ -111,14 +118,14 @@ func (app *appContext) authenticate(request *http.Request) (string, bool) {
 		if err = app.Secretly.Decode("session", cookie.Value, &cookieData); err == nil {
 			user, found := app.Sessions[cookieData["id"]]
 			if found && time.Now().Before(user.Start.Add(5*time.Minute)) {
+				fmt.Println("Request authenticated for user", user.ID)
 				return user.ID, true
 			}
 		}
 	}
+	fmt.Println("Request not authenticated")
 	return "none", false
 }
-
-// func (app *appContext) setCookie(userID string, response http.ResponseWriter) {}
 
 func (app *appContext) apiHandler(response http.ResponseWriter, request *http.Request) {
 	//Recover
@@ -132,8 +139,6 @@ func (app *appContext) apiHandler(response http.ResponseWriter, request *http.Re
 	response.Header().Set("Content-Type", "application/json; charset=UTF-8")
 
 	var command jsonRequest
-	// var params map[string]interface{}
-	// ctx := context.Background()
 	reply := jsonReply{Status: "error", Data: "unimplemented"}
 
 	err := json.NewDecoder(request.Body).Decode(&command)
@@ -177,7 +182,8 @@ func (app *appContext) apiHandler(response http.ResponseWriter, request *http.Re
 	case "continue":
 		if id, ok := app.authenticate(request); ok {
 			user := app.Sessions[id]
-			reply.Data = map[string]string{"firstName": user.FirstName, "lastName": user.LastName}
+			expiration := time.Until(user.Start.Add(5 * time.Minute)).Milliseconds()
+			reply.Data = map[string]interface{}{"firstName": user.FirstName, "lastName": user.LastName, "sessionExpiresIn": expiration}
 		} else {
 			reply.Data = "denied"
 		}
