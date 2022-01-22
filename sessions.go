@@ -102,10 +102,8 @@ func (app *appContext) serveRoot(res http.ResponseWriter, req *http.Request) {
 	if req.URL.Path == "/welcome.html" {
 		if _, ok := app.authenticate(req); ok {
 			http.ServeFile(res, req, filepath.Join(app.Path, "welcome.html"))
-			fmt.Println("Serving welcome")
 		} else {
 			http.ServeFile(res, req, filepath.Join(app.Path, "error404.html"))
-			fmt.Println("Serving 404")
 		}
 		return
 	}
